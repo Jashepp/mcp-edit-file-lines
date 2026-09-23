@@ -185,6 +185,7 @@ export async function searchFile(
   filepath: string,
   args: SearchFileArgs
 ): Promise<SearchResult> {
+  // verboseWhitespace is passed through for handler use; searchFile returns match data only.
   const startTime = performance.now();
 
   // Validate file size

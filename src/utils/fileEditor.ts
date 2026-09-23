@@ -1,6 +1,6 @@
 // utils/fileEditor.ts
 import fs from "fs/promises";
-import { createTwoFilesPatch } from "diff";
+import { createTwoFilesPatch, structuredPatch } from "diff";
 import {
   EditOperation,
   EditOperationResult,
@@ -172,6 +172,7 @@ class FileEditor {
 
     return lines
       .map((line) => {
+        if (line.trim() === "") return "";
         const lineIndentLevel = this.getIndentationLevel(line);
         const relativeIndent = " ".repeat(
           Math.max(0, lineIndentLevel - baseIndentLevel)
@@ -191,7 +192,9 @@ class FileEditor {
 
     // If no matching criteria specified, replace the entire line
     if (!edit.strMatch && !edit.regexMatch) {
-      return this.preserveIndentation(edit.content, indentation);
+      return edit.preserveIndentation === false
+        ? edit.content
+        : this.preserveIndentation(edit.content, indentation);
     }
 
     if (edit.strMatch) {
@@ -212,7 +215,13 @@ class FileEditor {
         }
         
         // For multi-line replacements, handle indentation
-        return this.preserveIndentation(edit.content, indentation);
+        return (
+          prefix +
+          (edit.preserveIndentation === false
+            ? edit.content
+            : this.preserveIndentation(edit.content, indentation)) +
+          suffix
+        );
       }
 
       // If exact match fails, try flexible whitespace matching
@@ -236,7 +245,9 @@ class FileEditor {
         if (!edit.content.includes('\n')) {
           return edit.content;
         }
-        return this.preserveIndentation(edit.content, indentation);
+        return edit.preserveIndentation === false
+          ? edit.content
+          : this.preserveIndentation(edit.content, indentation);
       });
     }
 
@@ -268,7 +279,9 @@ class FileEditor {
               return replaced;
             }
 
-            return this.preserveIndentation(replaced, indentation);
+            return edit.preserveIndentation === false
+              ? replaced
+              : this.preserveIndentation(replaced, indentation);
           }
 
           // For single-line replacements without capture groups
@@ -276,7 +289,9 @@ class FileEditor {
             return edit.content;
           }
 
-          return this.preserveIndentation(edit.content, indentation);
+          return edit.preserveIndentation === false
+            ? edit.content
+            : this.preserveIndentation(edit.content, indentation);
         });
       } catch (error) {
         if (error instanceof MatchNotFoundError) {
@@ -337,10 +352,10 @@ class FileEditor {
         } else {
           // For multi-line edits or full line replacements
           const firstLineIndentation = modifiedLines[startIdx].indentation;
-          const newContent = this.preserveIndentation(
-            edit.content,
-            firstLineIndentation
-          );
+          const newContent =
+            edit.preserveIndentation === false
+              ? edit.content
+              : this.preserveIndentation(edit.content, firstLineIndentation);
           const newLines = newContent.split("\n").map((line, idx) => ({
             content: line.trimLeft(),
             indentation: line.substring(
@@ -394,13 +409,98 @@ class FileEditor {
   getResults(): Map<number, EditOperationResult> {
     return this.results;
   }
+
+  getOriginalContent(): string {
+    return this.originalContent;
+  }
+}
+
+export function buildLineMap(
+  originalContent: string,
+  modifiedContent: string,
+  context: number = 3,
+  cap: number = 100
+): { lines: string[]; added: number; removed: number } {
+  const patches = structuredPatch(
+    "original",
+    "modified",
+    originalContent,
+    modifiedContent,
+    "",
+    "",
+    { context }
+  );
+
+  let allLines: string[] = [];
+  let added = 0;
+  let removed = 0;
+
+  for (const hunk of patches.hunks) {
+    let oldCounter = hunk.oldStart;
+    let newCounter = hunk.newStart;
+
+    for (const line of hunk.lines) {
+      if (line.startsWith(" ")) {
+        allLines.push(`KEEP ${oldCounter}: ${line.slice(1)}`);
+        oldCounter++;
+        newCounter++;
+      } else if (line.startsWith("-")) {
+        allLines.push(`REMOVE ${oldCounter}: ${line.slice(1)}`);
+        oldCounter++;
+        removed++;
+      } else if (line.startsWith("+")) {
+        allLines.push(`ADD ${newCounter}: ${line.slice(1)}`);
+        newCounter++;
+        added++;
+      }
+    }
+  }
+
+  if (allLines.length === 0) {
+    return { lines: [], added: 0, removed: 0 };
+  }
+
+  if (allLines.length > cap) {
+    const firstHalf = allLines.slice(0, 50);
+    const lastHalf = allLines.slice(-50);
+    const omitted = allLines.length - 100;
+    return {
+      lines: [...firstHalf, `... (${omitted} lines omitted) ...`, ...lastHalf],
+      added,
+      removed
+    };
+  }
+
+  return { lines: allLines, added, removed };
+}
+
+export function formatEditOutput(
+  unifiedDiff: string,
+  lineMap: { lines: string[]; added: number; removed: number }
+): string {
+  const addedText =
+    lineMap.added === 1 ? "1 line added" : `${lineMap.added} lines added`;
+  const removedText =
+    lineMap.removed === 1 ? "1 line removed" : `${lineMap.removed} lines removed`;
+
+  let output = `Result: ${addedText}, ${removedText}\nLine map:\n`;
+  for (const line of lineMap.lines) {
+    output += `${line}\n`;
+  }
+  output += `\nUnified diff:\n${unifiedDiff}`;
+
+  return output;
 }
 
 export async function editFile(
   filepath: string,
   edits: EditOperation[],
   dryRun = false
-): Promise<{ diff: string; results: Map<number, EditOperationResult> }> {
+): Promise<{
+  diff: string;
+  lineMap: { lines: string[]; added: number; removed: number };
+  results: Map<number, EditOperationResult>;
+}> {
   // Read file content
   const content = await fs.readFile(filepath, "utf-8");
 
@@ -419,14 +519,18 @@ export async function editFile(
     // Create diff
     const diff = editor.createDiff(modifiedContent, filepath);
 
+    // Build line map
+    const lineMap = buildLineMap(editor.getOriginalContent(), modifiedContent);
+
     // Write changes if not dry run
     if (!dryRun) {
       await fs.writeFile(filepath, modifiedContent, "utf-8");
     }
 
-    // Return both diff and results
+    // Return diff, lineMap and results
     return {
       diff,
+      lineMap,
       results: editor.getResults()
     };
   } catch (error) {
@@ -437,4 +541,110 @@ export async function editFile(
       `Failed to apply edits: ${error instanceof Error ? error.message : "Unknown error"}`
     );
   }
+}
+
+/**
+ * Insert lines after a given line number. afterLine=0 inserts at file start.
+ */
+export async function insertFileLines(
+  filepath: string,
+  afterLine: number,
+  content: string,
+  dryRun: boolean
+): Promise<{ diff: string; lineMap: { lines: string[]; added: number; removed: number } }> {
+  const original = await fs.readFile(filepath, "utf-8");
+  const normalized = normalizeLineEndings(original);
+  const lines = normalized.split("\n");
+
+  let totalLines = lines.length;
+  if (lines.length > 0 && lines[lines.length - 1] === "") {
+    totalLines -= 1;
+  }
+
+  if (afterLine < 0 || afterLine > totalLines) {
+    throw new Error(
+      `Invalid insertion position: file has ${totalLines} lines, afterLine must be 0 to ${totalLines}`
+    );
+  }
+
+  const newLines = normalizeLineEndings(content + "").split("\n");
+  const modifiedLines = [
+    ...lines.slice(0, afterLine),
+    ...newLines,
+    ...lines.slice(afterLine)
+  ];
+
+  let modified = modifiedLines.join("\n");
+  if (modifiedLines.length > 1 && normalized.endsWith("\n") && !modified.endsWith("\n")) {
+    modified += "\n";
+  }
+
+  if (!dryRun) {
+    await fs.writeFile(filepath, modified, "utf-8");
+  }
+
+  const diff = createTwoFilesPatch(
+    filepath,
+    filepath,
+    normalized,
+    modified,
+    "original",
+    "modified"
+  );
+
+  const lineMap = buildLineMap(normalized, modified);
+
+  return { diff, lineMap };
+}
+
+/**
+ * Delete a range of lines (startLine..endLine inclusive, 1-indexed).
+ */
+export async function deleteFileLines(
+  filepath: string,
+  startLine: number,
+  endLine: number,
+  dryRun: boolean
+): Promise<{ diff: string; lineMap: { lines: string[]; added: number; removed: number } }> {
+  const original = await fs.readFile(filepath, "utf-8");
+  const normalized = normalizeLineEndings(original);
+  const lines = normalized.split("\n");
+
+  let totalLines = lines.length;
+  if (lines.length > 0 && lines[lines.length - 1] === "") {
+    totalLines -= 1;
+  }
+
+  if (startLine < 1 || startLine > endLine || endLine > totalLines) {
+    throw new Error(
+      `Invalid line range: file has ${totalLines} lines, startLine must be 1 to ${totalLines}, endLine must be ${startLine} to ${totalLines}`
+    );
+  }
+
+  const modifiedLines = [
+    ...lines.slice(0, startLine - 1),
+    ...lines.slice(endLine)
+  ];
+
+  let modified = modifiedLines.join("\n");
+  if (modifiedLines.length > 1 && normalized.endsWith("\n") && !modified.endsWith("\n")) {
+    modified += "\n";
+  }
+
+  if (!dryRun) {
+    await fs.writeFile(filepath, modified, "utf-8");
+  }
+
+  const diff = createTwoFilesPatch(
+    filepath,
+    filepath,
+    normalized,
+    modified,
+    "original",
+    "modified"
+  );
+
+  const lineMap = buildLineMap(normalized, modified);
+
+  return { diff, lineMap };
 }

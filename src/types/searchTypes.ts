@@ -49,7 +49,11 @@ export const SearchFileArgsSchema = z.object({
   multiline: z
     .boolean()
     .default(false)
-    .describe("Enable multiline regex mode. default: false")
+    .describe("Enable multiline regex mode. default: false"),
+  verboseWhitespace: z
+    .boolean()
+    .default(false)
+    .describe("Also render each displayed line with exact whitespace characters: TAB -> \\t, SPACE -> \\s. Use when indentation must be reproduced verbatim. default: false")
 });
 
 export type SearchFileArgs = z.infer<typeof SearchFileArgsSchema>;

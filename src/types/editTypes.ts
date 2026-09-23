@@ -8,6 +8,7 @@ export interface EditOperation {
   content: string;
   strMatch?: string;
   regexMatch?: string;
+  preserveIndentation?: boolean;
 }
 
 // Schema for individual edit operations
@@ -35,6 +36,12 @@ export const EditSchema = z
       .optional()
       .describe(
         "Optional regex pattern to match and replace while preserving line formatting"
+      ),
+    preserveIndentation: z
+      .boolean()
+      .default(true)
+      .describe(
+        "Rebase content indentation to the target line's indent (true, default). Set false to use content VERBATIM - copy exact indentation from get_file_lines first. default: true"
       )
   })
   .refine((data) => data.startLine <= data.endLine, {

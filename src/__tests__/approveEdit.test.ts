@@ -220,4 +220,153 @@ describe("approveEdit", () => {
     expect(newContent).toBe(content);
     expect(stateManager.getState(stateId)).toBeUndefined();
   });
+
+  it("should apply add_file_lines insert after saveAddState and approveEdit", async () => {
+    const afterLine = 1;
+    const newLine = "inserted line";
+    const stateId = stateManager.saveAddState(tempFilePath, afterLine, newLine);
+
+    const result = await approveEdit(stateId, stateManager);
+
+    const newContent = await fs.readFile(tempFilePath, "utf-8");
+    expect(newContent).toBe("line 1\ninserted line\nline 2\nline 3\nline 4\nline 5\n");
+    expect(result).toContain("+inserted line");
+    expect(stateManager.getState(stateId)).toBeUndefined();
+  });
+
+  it("should apply remove_file_lines delete after saveRemoveState and approveEdit", async () => {
+    const startLine = 2;
+    const endLine = 3;
+    const stateId = stateManager.saveRemoveState(tempFilePath, startLine, endLine);
+
+    const result = await approveEdit(stateId, stateManager);
+
+    const newContent = await fs.readFile(tempFilePath, "utf-8");
+    expect(newContent).toBe("line 1\nline 4\nline 5\n");
+    expect(result).toContain("-line 2");
+    expect(result).toContain("-line 3");
+    expect(stateManager.getState(stateId)).toBeUndefined();
+  });
+
+  it("should preserve state if add_file_lines fails (afterLine too large)", async () => {
+    const stateId = stateManager.saveAddState(tempFilePath, 999, "inserted line");
+
+    await expect(approveEdit(stateId, stateManager)).rejects.toThrow(
+      "Invalid insertion position"
+    );
+
+    expect(stateManager.getState(stateId)).toBeDefined();
+    const unchanged = await fs.readFile(tempFilePath, "utf-8");
+    expect(unchanged).toBe(content);
+  });
+
+  it("should preserve state if remove_file_lines fails (line range too large)", async () => {
+    const stateId = stateManager.saveRemoveState(tempFilePath, 999, 1000);
+
+    await expect(approveEdit(stateId, stateManager)).rejects.toThrow(
+      "Invalid line range"
+    );
+
+    expect(stateManager.getState(stateId)).toBeDefined();
+    const unchanged = await fs.readFile(tempFilePath, "utf-8");
+    expect(unchanged).toBe(content);
+  });
+
+// add_file_lines additional tests
+it("should apply add_file_lines with multi-line content", async () => {
+    const stateId = stateManager.saveAddState(
+      tempFilePath,
+      1,
+      "inserted line 1\ninserted line 2\ninserted line 3"
+    );
+
+    await approveEdit(stateId, stateManager);
+
+    const newContent = await fs.readFile(tempFilePath, "utf-8");
+    expect(newContent).toBe(
+      "line 1\ninserted line 1\ninserted line 2\ninserted line 3\nline 2\nline 3\nline 4\nline 5\n"
+    );
+    expect(stateManager.getState(stateId)).toBeUndefined();
+  });
+
+  it("should apply add_file_lines at file start (afterLine=0)", async () => {
+    const stateId = stateManager.saveAddState(tempFilePath, 0, "first line");
+
+    await approveEdit(stateId, stateManager);
+
+    const newContent = await fs.readFile(tempFilePath, "utf-8");
+    expect(newContent).toBe("first line\nline 1\nline 2\nline 3\nline 4\nline 5\n");
+    expect(stateManager.getState(stateId)).toBeUndefined();
+  });
+
+  it("should apply add_file_lines to empty file", async () => {
+    const emptyFilePath = await createTempFile("");
+    const stateId = stateManager.saveAddState(emptyFilePath, 0, "first line");
+
+    await approveEdit(stateId, stateManager);
+
+    const newContent = await fs.readFile(emptyFilePath, "utf-8");
+    expect(newContent).toBe("first line\n");
+    expect(stateManager.getState(stateId)).toBeUndefined();
+  });
+
+  it("should apply add_file_lines at end of LF file (afterLine=totalLines)", async () => {
+    const stateId = stateManager.saveAddState(tempFilePath, 5, "last line");
+
+    await approveEdit(stateId, stateManager);
+
+    const newContent = await fs.readFile(tempFilePath, "utf-8");
+    expect(newContent).toBe("line 1\nline 2\nline 3\nline 4\nline 5\nlast line\n");
+    expect(stateManager.getState(stateId)).toBeUndefined();
+  });
+
+  it("should leave file untouched in dry run mode (add_file_lines)", async () => {
+    const { insertFileLines } = await import("../utils/fileEditor.js");
+    await insertFileLines(tempFilePath, 1, "inserted line", true);
+
+    const fileContent = await fs.readFile(tempFilePath, "utf-8");
+    expect(fileContent).toBe(content);
+  });
+
+  // remove_file_lines additional tests
+  it("should remove a single line", async () => {
+    const stateId = stateManager.saveRemoveState(tempFilePath, 2, 2);
+
+    const result = await approveEdit(stateId, stateManager);
+
+    const newContent = await fs.readFile(tempFilePath, "utf-8");
+    expect(newContent).toBe("line 1\nline 3\nline 4\nline 5\n");
+    expect(result).toContain("-line 2");
+    expect(stateManager.getState(stateId)).toBeUndefined();
+  });
+
+  it("should remove all lines leaving empty file", async () => {
+    const stateId = stateManager.saveRemoveState(tempFilePath, 1, 5);
+
+    await approveEdit(stateId, stateManager);
+
+    const newContent = await fs.readFile(tempFilePath, "utf-8");
+    expect(newContent).toBe("");
+    expect(stateManager.getState(stateId)).toBeUndefined();
+  });
+
+  it("should throw for remove_file_lines with startLine > endLine", async () => {
+    const stateId = stateManager.saveRemoveState(tempFilePath, 5, 2);
+
+    await expect(approveEdit(stateId, stateManager)).rejects.toThrow(
+      "Invalid line range"
+    );
+
+    expect(stateManager.getState(stateId)).toBeDefined();
+    const unchanged = await fs.readFile(tempFilePath, "utf-8");
+    expect(unchanged).toBe(content);
+  });
+
+  it("should leave file untouched in dry run mode (remove_file_lines)", async () => {
+    const { deleteFileLines } = await import("../utils/fileEditor.js");
+    await deleteFileLines(tempFilePath, 2, 3, true);
+
+    const fileContent = await fs.readFile(tempFilePath, "utf-8");
+    expect(fileContent).toBe(content);
+  });
 });

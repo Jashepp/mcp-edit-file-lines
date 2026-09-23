@@ -14,17 +14,31 @@ import { zodToJsonSchema } from "zod-to-json-schema";
 import { EditFileArgsSchema, EditOperation } from "./types/editTypes.js";
 import { SearchError, SearchFileArgsSchema } from "./types/searchTypes.js";
 import { approveEdit } from "./utils/approveEdit.js";
-import { editFile } from "./utils/fileEditor.js";
+import {
+  editFile,
+  formatEditOutput,
+  insertFileLines,
+  deleteFileLines
+} from "./utils/fileEditor.js";
 import { searchFile } from "./utils/fileSearch.js";
 import { getLineInfo } from "./utils/lineInfo.js";
+import { renderWhitespace, WHITESPACE_LEDGER } from "./utils/utils.js";
 import { StateManager } from "./utils/stateManager.js";
+import { initForceDryRun, forceDryRun, checkForceDryRun } from "./utils/forceDryRun.js";
 
 const ToolInputSchema = ToolSchema.shape.inputSchema;
 type ToolInput = z.infer<typeof ToolInputSchema>;
 
+// Initialize force-dry-run mode from CLI arguments
+initForceDryRun();
+
 // Command line argument parsing
 const args = process.argv.slice(2);
-if (args.length === 0) {
+
+// Filter out CLI flags (any argument starting with -- that has no /, \, or .)
+const allowedDirs = args.filter((a) => !(a.startsWith("--") && !a.includes("/") && !a.includes("\\") && !a.includes(".")));
+
+if (allowedDirs.length === 0) {
   console.error(
     "Usage: ./build/index.js <allowed-directory> [additional-directories...]"
   );
@@ -44,13 +58,13 @@ function expandHome(filepath: string): string {
 }
 
 // Store allowed directories in normalized form
-const allowedDirectories = args.map((dir) =>
+const allowedDirectories = allowedDirs.map((dir) =>
   normalizePath(path.resolve(expandHome(dir)))
 );
 
 // Validate directories
 await Promise.all(
-  args.map(async (dir) => {
+  allowedDirs.map(async (dir) => {
     try {
       const stats = await fs.stat(dir);
       if (!stats.isDirectory()) {
@@ -125,7 +139,11 @@ const GetLineInfoArgsSchema = z.object({
     .int()
     .min(0)
     .default(2)
-    .describe("Number of context lines before and after. default: 2")
+    .describe("Number of context lines before and after. default: 2"),
+  verboseWhitespace: z
+    .boolean()
+    .default(false)
+    .describe("Also render each displayed line with exact whitespace characters: TAB -> \\t, SPACE -> \\s. Use when indentation must be reproduced verbatim. default: false")
 });
 
 // Add to server setup section
@@ -156,7 +174,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
 - Replace regex matches while preserving line formatting (using regexMatch)
 - Handle multiple lines with full content replacement
 When dryRun is true, returns a diff and a stateId that can be used with approve_edit tool to apply the edit.
-The stateId is only valid for 1 minute.`,
+The stateId is only valid for 1 minute.
+To INSERT lines use add_file_lines; to DELETE lines use remove_file_lines. Set preserveIndentation:false when your content carries exact indentation copied from get_file_lines.`,
         inputSchema: zodToJsonSchema(EditFileArgsSchema) as ToolInput
       },
       {
@@ -176,18 +195,44 @@ The stateId is only valid for 1 minute.`,
         description:
           "Get information about specific line numbers in a file, including their content " +
           "and optional context lines. Useful for verifying line numbers before making edits. " +
-          "Only works within allowed directories.",
+          "Only works within allowed directories. " +
+          "Pass verboseWhitespace:true to see TAB/SPACE characters exactly (needed before composing preserveIndentation:false content).",
         inputSchema: zodToJsonSchema(GetLineInfoArgsSchema) as ToolInput
       },
       {
         name: "search_file",
         description: `Search a file for text or regex patterns and return line numbers, content, and surrounding context. Useful for finding exact locations before making edits with edit_file_lines. Features:
-  - Simple text search with optional case sensitivity
-  - Regular expression support with multiline mode
-  - Whole word matching option
-  - Configurable context lines
-  - Returns line numbers, content, and surrounding context`,
+    - Simple text search with optional case sensitivity
+    - Regular expression support with multiline mode
+    - Whole word matching option
+    - Configurable context lines
+    - Returns line numbers, content, and surrounding context
+Pass verboseWhitespace:true to see TAB/SPACE characters exactly (needed before composing preserveIndentation:false content).`,
         inputSchema: zodToJsonSchema(SearchFileArgsSchema) as ToolInput
+      },
+      {
+        name: "add_file_lines",
+        description: `INSERT new line(s) after a given line number without removing anything. afterLine=0 inserts at file start. Use this to ADD lines - never replace a line with 'old line + new line' via edit_file_lines (that pattern deletes the original line by accident). Pure insertion: the line map will show ADD and KEEP lines only, no REMOVE.`,
+        inputSchema: zodToJsonSchema(
+          z.object({
+            p: z.string().describe("Absolute file path"),
+            afterLine: z.number().int().describe("Insert after this line number; 0 = start of file (before line 1)"),
+            content: z.string().describe("New line(s) to insert, multi-line allowed"),
+            dryRun: z.boolean().default(false).describe("Show diff without writing")
+          })
+        ) as ToolInput
+      },
+      {
+        name: "remove_file_lines",
+        description: "DELETE a range of lines (startLine..endLine inclusive). Pure removal: the line map will show only REMOVE and KEEP lines, no ADD.",
+        inputSchema: zodToJsonSchema(
+          z.object({
+            p: z.string().describe("Absolute file path"),
+            startLine: z.number().int().describe("First line to delete"),
+            endLine: z.number().int().describe("Last line to delete (inclusive)"),
+            dryRun: z.boolean().default(false).describe("Show diff without writing")
+          })
+        ) as ToolInput
       }
     ]
   };
@@ -205,13 +250,23 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         );
       }
 
+      const dryRunError = checkForceDryRun(parsed.data.dryRun);
+      if (dryRunError) {
+        return { content: [dryRunError] };
+      }
+
       try {
         const validPath = await validatePath(parsed.data.p);
 
         // Convert array-style edits to object style
         const edits: EditOperation[] = parsed.data.e;
 
-        const { diff } = await editFile(validPath, edits, parsed.data.dryRun);
+        const { diff, lineMap } = await editFile(
+          validPath,
+          edits,
+          parsed.data.dryRun
+        );
+        const formatted = formatEditOutput(diff, lineMap);
 
         // For dry run, save state and return stateId
         if (parsed.data.dryRun) {
@@ -220,7 +275,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             content: [
               {
                 type: "text",
-                text: `${diff}\nState ID: ${stateId}\nUse this ID with approve_edit to apply the changes.`
+                text: `${formatted}\nState ID: ${stateId}\nUse this ID with approve_edit to apply the changes.`
               }
             ]
           };
@@ -230,7 +285,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           content: [
             {
               type: "text",
-              text: diff
+              text: formatted
             }
           ]
         };
@@ -282,7 +337,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const result = await getLineInfo(
           validPath,
           parsed.data.lineNumbers,
-          parsed.data.context
+          parsed.data.context,
+          parsed.data.verboseWhitespace
         );
         return { content: [{ type: "text", text: result }] };
       } catch (error) {
@@ -317,6 +373,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           ""
         ];
 
+        const shownLines = new Map<number, string>();
+
         result.matches.forEach((match, i) => {
           output.push(
             `Match ${i + 1}: Line ${match.line}, Column ${match.column}`,
@@ -336,10 +394,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             const linePrefix = lineNumber.toString().padStart(4, " ");
             const indicator = lineNumber === match.line ? ">" : " ";
             output.push(`${indicator} ${linePrefix} | ${line}`);
+            shownLines.set(lineNumber, line);
           });
 
           output.push(""); // Empty line between matches
         });
+
+        if (parsed.data.verboseWhitespace) {
+          output.push("", WHITESPACE_LEDGER);
+          for (const [lineNumber, line] of [...shownLines.entries()].sort((a, b) => a[0] - b[0])) {
+            output.push(`  ${lineNumber}: ${renderWhitespace(line)}`);
+          }
+        }
 
         return {
           content: [
@@ -366,6 +432,112 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           };
         }
         throw error;
+      }
+    }
+
+    if (name === "add_file_lines") {
+      const parsed = z
+        .object({
+          p: z.string(),
+          afterLine: z.number().int(),
+          content: z.string(),
+          dryRun: z.boolean().optional()
+        })
+        .safeParse(args);
+      if (!parsed.success) {
+        throw new Error(`Invalid arguments: ${parsed.error} `);
+      }
+
+      const dryRunError = checkForceDryRun(parsed.data.dryRun ?? false);
+      if (dryRunError) {
+        return { content: [dryRunError] };
+      }
+
+      try {
+        const validPath = await validatePath(parsed.data.p);
+        const { afterLine, content } = parsed.data;
+        const dryRun = parsed.data.dryRun ?? false;
+
+        if (dryRun) {
+          const stateId = stateManager.saveAddState(validPath, afterLine, content);
+          const result = await insertFileLines(validPath, afterLine, content, true);
+          return {
+            content: [
+              {
+                type: "text",
+                text: formatEditOutput(result.diff, result.lineMap) + "\nState ID: " + stateId
+              }
+            ]
+          };
+        }
+
+        const result = await insertFileLines(validPath, afterLine, content, false);
+        return {
+          content: [{ type: "text", text: formatEditOutput(result.diff, result.lineMap) }]
+        };
+      } catch (error) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Error: ${error instanceof Error ? error.message : String(error)}`
+            }
+          ],
+          isError: true
+        };
+      }
+    }
+
+    if (name === "remove_file_lines") {
+      const parsed = z
+        .object({
+          p: z.string(),
+          startLine: z.number().int(),
+          endLine: z.number().int(),
+          dryRun: z.boolean().optional()
+        })
+        .safeParse(args);
+      if (!parsed.success) {
+        throw new Error(`Invalid arguments: ${parsed.error} `);
+      }
+
+      const dryRunError = checkForceDryRun(parsed.data.dryRun ?? false);
+      if (dryRunError) {
+        return { content: [dryRunError] };
+      }
+
+      try {
+        const validPath = await validatePath(parsed.data.p);
+        const { startLine, endLine } = parsed.data;
+        const dryRun = parsed.data.dryRun ?? false;
+
+        if (dryRun) {
+          const stateId = stateManager.saveRemoveState(validPath, startLine, endLine);
+          const result = await deleteFileLines(validPath, startLine, endLine, true);
+          return {
+            content: [
+              {
+                type: "text",
+                text: formatEditOutput(result.diff, result.lineMap) + "\nState ID: " + stateId
+              }
+            ]
+          };
+        }
+
+        const result = await deleteFileLines(validPath, startLine, endLine, false);
+        return {
+          content: [{ type: "text", text: formatEditOutput(result.diff, result.lineMap) }]
+        };
+      } catch (error) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Error: ${error instanceof Error ? error.message : String(error)}`
+            }
+          ],
+          isError: true
+        };
       }
     }
 

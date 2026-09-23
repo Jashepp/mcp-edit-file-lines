@@ -3,8 +3,13 @@ import { createHash } from "crypto";
 import { EditOperation } from "../types/editTypes.js";
 
 interface EditState {
+  kind: "edit" | "add" | "remove";
   path: string;
-  edits: EditOperation[];
+  edits?: EditOperation[];
+  afterLine?: number;
+  content?: string;
+  startLine?: number;
+  endLine?: number;
   timestamp: number;
 }
 
@@ -34,24 +39,12 @@ export class StateManager {
     }
   }
 
-  private generateStateId(path: string, edits: EditOperation[]): string {
-    // Sort edits by line numbers to ensure consistent hashing
-    const sortedEdits = [...edits].sort((a, b) =>
-      a.startLine === b.startLine
-        ? a.endLine - b.endLine
-        : a.startLine - b.startLine
-    );
-
-    // Create a deterministic string representation
-    const content = JSON.stringify({
-      path,
-      edits: sortedEdits.map((edit) => ({
-        ...edit,
-        strMatch: edit.strMatch?.trim(),
-        regexMatch: edit.regexMatch?.trim()
-      }))
-    });
-
+  private generateStateId(
+    kind: "edit" | "add" | "remove",
+    params: Record<string, unknown>
+  ): string {
+    // Kind is always included to distinguish edit/add/remove with same params
+    const content = JSON.stringify({ kind, ...params });
     return createHash("sha256").update(content).digest("hex").slice(0, 8);
   }
 
@@ -84,11 +77,73 @@ export class StateManager {
       };
     });
 
-    const stateId = this.generateStateId(path, normalizedEdits);
+    const stateId = this.generateStateId("edit", {
+      path,
+      edits: normalizedEdits.map((edit) => ({
+        ...edit,
+        strMatch: edit.strMatch?.trim(),
+        regexMatch: edit.regexMatch?.trim()
+      }))
+    });
 
     this.states.set(stateId, {
+      kind: "edit",
       path,
       edits: normalizedEdits,
+      timestamp: Date.now()
+    });
+
+    return stateId;
+  }
+
+  /**
+   * Save add (insert) state and return a state ID
+   * @param path File path
+   * @param afterLine Line number to insert after; 0 = start of file
+   * @param content New line(s) to insert
+   * @returns State ID for later retrieval
+   */
+  saveAddState(path: string, afterLine: number, content: string): string {
+    this.cleanup();
+
+    const stateId = this.generateStateId("add", {
+      path,
+      afterLine,
+      content: content.trim()
+    });
+
+    this.states.set(stateId, {
+      kind: "add",
+      path,
+      afterLine,
+      content,
+      timestamp: Date.now()
+    });
+
+    return stateId;
+  }
+
+  /**
+   * Save remove (delete) state and return a state ID
+   * @param path File path
+   * @param startLine First line to delete
+   * @param endLine Last line to delete (inclusive)
+   * @returns State ID for later retrieval
+   */
+  saveRemoveState(path: string, startLine: number, endLine: number): string {
+    this.cleanup();
+
+    const stateId = this.generateStateId("remove", {
+      path,
+      startLine,
+      endLine
+    });
+
+    this.states.set(stateId, {
+      kind: "remove",
+      path,
+      startLine,
+      endLine,
       timestamp: Date.now()
     });
 

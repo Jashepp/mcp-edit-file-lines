@@ -102,7 +102,7 @@ describe("StateManager", () => {
       expect(state).toBeDefined();
       expect(state?.path).toBe(samplePath);
       expect(state?.edits).toHaveLength(1);
-      expect(state?.edits[0]).toEqual(sampleEdit);
+      expect(state?.edits?.[0]).toEqual(sampleEdit);
     });
 
     it("should handle expired states", async () => {
@@ -162,6 +162,52 @@ describe("StateManager", () => {
       shortTTLManager.getState("any-id");
 
       expect(shortTTLManager.getActiveStateCount()).toBe(0);
+    });
+  });
+
+  describe("saveAddState and saveRemoveState", () => {
+    it("should save add state and retrieve it", () => {
+      const stateId = stateManager.saveAddState("/path/to/file.txt", 1, "new line");
+      expect(stateId).toMatch(/^[a-f0-9]{8}$/);
+      const state = stateManager.getState(stateId);
+      expect(state).toBeDefined();
+      expect(state?.kind).toBe("add");
+      expect(state?.path).toBe("/path/to/file.txt");
+      expect(state?.afterLine).toBe(1);
+      expect(state?.content).toBe("new line");
+    });
+
+    it("should save remove state and retrieve it", () => {
+      const stateId = stateManager.saveRemoveState("/path/to/file.txt", 2, 4);
+      expect(stateId).toMatch(/^[a-f0-9]{8}$/);
+      const state = stateManager.getState(stateId);
+      expect(state).toBeDefined();
+      expect(state?.kind).toBe("remove");
+      expect(state?.path).toBe("/path/to/file.txt");
+      expect(state?.startLine).toBe(2);
+      expect(state?.endLine).toBe(4);
+    });
+
+    it("add and edit on same file should produce distinct IDs", () => {
+      const editId = stateManager.saveState("/path/to/file.txt", [
+        { startLine: 1, endLine: 1, content: "line 1" }
+      ]);
+      const addId = stateManager.saveAddState("/path/to/file.txt", 0, "line 1");
+      expect(editId).not.toBe(addId);
+    });
+
+    it("remove and edit on same file should produce distinct IDs", () => {
+      const editId = stateManager.saveState("/path/to/file.txt", [
+        { startLine: 1, endLine: 1, content: "line 1" }
+      ]);
+      const removeId = stateManager.saveRemoveState("/path/to/file.txt", 1, 1);
+      expect(editId).not.toBe(removeId);
+    });
+
+    it("remove and add on same file should produce distinct IDs", () => {
+      const addId = stateManager.saveAddState("/path/to/file.txt", 0, "line 1");
+      const removeId = stateManager.saveRemoveState("/path/to/file.txt", 1, 1);
+      expect(addId).not.toBe(removeId);
     });
   });
 });

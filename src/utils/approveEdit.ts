@@ -1,5 +1,10 @@
 // utils/approveEdit.ts
-import { editFile } from "./fileEditor.js";
+import {
+  editFile,
+  formatEditOutput,
+  insertFileLines,
+  deleteFileLines
+} from "./fileEditor.js";
 import { StateManager } from "./stateManager.js";
 
 export async function approveEdit(
@@ -12,17 +17,44 @@ export async function approveEdit(
   }
 
   try {
-    // Get saved edit state
-    const { diff } = await editFile(
-      savedState.path,
-      savedState.edits,
-      false // Not a dry run - actually apply the changes
-    );
+    let diff: string;
+    let lineMap: { lines: string[]; added: number; removed: number };
 
-    // Only delete the state if the edit was successful
+    switch (savedState.kind) {
+      case "edit": {
+        const result = await editFile(savedState.path, savedState.edits!, false);
+        diff = result.diff;
+        lineMap = result.lineMap;
+        break;
+      }
+      case "add": {
+        const result = await insertFileLines(
+          savedState.path,
+          savedState.afterLine!,
+          savedState.content!,
+          false
+        );
+        diff = result.diff;
+        lineMap = result.lineMap;
+        break;
+      }
+      case "remove": {
+        const result = await deleteFileLines(
+          savedState.path,
+          savedState.startLine!,
+          savedState.endLine!,
+          false
+        );
+        diff = result.diff;
+        lineMap = result.lineMap;
+        break;
+      }
+    }
+
+    // Only delete the state if the operation was successful
     stateManager.deleteState(stateId);
 
-    return diff;
+    return formatEditOutput(diff, lineMap);
   } catch (error) {
     // If anything fails, preserve the state and re-throw
     throw error;

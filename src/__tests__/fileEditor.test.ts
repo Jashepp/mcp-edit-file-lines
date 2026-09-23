@@ -2,7 +2,7 @@ import fs from "fs/promises";
 import path from "path";
 import { fileURLToPath } from "url";
 import { EditOperation, MatchNotFoundError } from "../types/editTypes.js";
-import { editFile } from "../utils/fileEditor.js";
+import { editFile, formatEditOutput } from "../utils/fileEditor.js";
 import { resetFixtures } from "./utils.js";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -315,6 +315,189 @@ describe("FileEditor", () => {
       await editFile(testMatchesPath, [edit], false);
       const content = await fs.readFile(testMatchesPath, "utf-8");
       expect(content).toContain('color = "red"');
+    });
+  });
+
+  // preserveIndentation flag tests
+  describe("preserveIndentation Flag", () => {
+    it("should keep exact indentation verbatim when false (a)", async () => {
+      // File uses 2-space indentation on line 2; content uses 4-space
+      const edit: EditOperation = {
+        startLine: 2,
+        endLine: 2,
+        content: "    const Button = ({ color = 'purple', size = 'xl' }) => {}",
+        preserveIndentation: false
+      };
+      const { diff } = await editFile(testMatchesPath, [edit], true);
+      // Content should use 4 spaces, not rebased to 0 (file's indentation on line 2)
+      expect(diff).toContain(
+        "+    const Button = ({ color = 'purple', size = 'xl' }) => {}"
+      );
+    });
+
+    it("should keep blank lines empty when false (b)", async () => {
+      // Multi-line content with blank line in middle
+      const edit: EditOperation = {
+        startLine: 7,
+        endLine: 7,
+        content: "export const Card = ({ title });\n\nexport const Helper = () => {}",
+        preserveIndentation: false
+      };
+      const { diff } = await editFile(testMatchesPath, [edit], true);
+      // Blank line should be truly empty (no trailing spaces)
+      expect(diff).toContain(
+        "+export const Card = ({ title });"
+      );
+      // The blank line becomes a separate hunk line (just "+") - assert no "  " after it
+      const blankLineRegex = /\+export const Card = \(\{ title \}\);[\s\S]*\n\+\n/;
+      expect(diff).toMatch(blankLineRegex);
+    });
+
+    it("should keep strMatch span replacement verbatim when false (c)", async () => {
+      const edit: EditOperation = {
+        startLine: 2,
+        endLine: 2,
+        content: "    'purple'",
+        strMatch: '"blue"',
+        preserveIndentation: false
+      };
+      const { diff } = await editFile(testMatchesPath, [edit], true);
+      expect(diff).toContain(
+        "+const Button = ({ color =     'purple', size = \"md\" }) => {"
+      );
+    });
+
+    it("should keep blank line blank when true (d)", async () => {
+      // Multi-line content with a blank line inside; should stay blank with default (true)
+      const edit: EditOperation = {
+        startLine: 7,
+        endLine: 7,
+        content:
+          "export const Card = ({ title });\n\n  // helper comment"
+      };
+      const { diff } = await editFile(testMatchesPath, [edit], true);
+      // The middle blank line must be truly empty (no leading spaces)
+      const blankLineRegex =
+        /^\+export const Card = \(\{ title \}\);[\s\S]*^\+[\s\S]*^\+\s{2}\/\/ helper comment$/m;
+      expect(diff).toMatch(blankLineRegex);
+    });
+
+    it("should preserve prefix/suffix when strMatch matches mid-line span with single-line content (e - RC2)", async () => {
+      const edit: EditOperation = {
+        startLine: 9,
+        endLine: 9,
+        content: "New subtitle text",
+        strMatch: "Default subtitle"
+      };
+      const { diff } = await editFile(testMatchesPath, [edit], true);
+      expect(diff).toContain(
+        '+  subtitle = "New subtitle text",'
+      );
+    });
+
+    it("should replace span mid-line with multi-line content and preserve prefix/suffix (e2)", async () => {
+      // The line is:   subtitle = "Default subtitle",
+      // strMatch matches mid-line span; content has newlines
+      const edit: EditOperation = {
+        startLine: 9,
+        endLine: 9,
+        content: '"First line"\n"Second line"',
+        strMatch: 'Default subtitle"'
+      };
+      const { diff } = await editFile(testMatchesPath, [edit], true);
+      expect(diff).toContain('+  subtitle = "  "First line"');
+      expect(diff).toContain('  "Second line",');
+    });
+
+    it("should not modify file in dry run mode (regression)", async () => {
+      const edit: EditOperation = {
+        startLine: 2,
+        endLine: 2,
+        content: 'const Button = ({ color = "red", size = "md" }) => {'
+      };
+
+      await editFile(testMatchesPath, [edit], true);
+      const content = await fs.readFile(testMatchesPath, "utf-8");
+      expect(content).toContain('color = "blue"');
+    });
+  });
+
+  // Line map / Result tests
+  describe("Line Map and Result", () => {
+    it("should report replace operation with 1 line added, 1 line removed (f)", async () => {
+      const edit: EditOperation = {
+        startLine: 2,
+        endLine: 2,
+        content: 'const Button = ({ color = "purple", size = "xl" }) => {'
+      };
+      const { diff, lineMap } = await editFile(testMatchesPath, [edit], true);
+      const formatted = formatEditOutput(diff, lineMap);
+      expect(formatted).toContain(
+        "Result: 1 line added, 1 line removed"
+      );
+      expect(formatted).toContain("REMOVE 2: ");
+      expect(formatted).toContain("ADD 2: ");
+      expect(lineMap.added).toBe(1);
+      expect(lineMap.removed).toBe(1);
+    });
+
+    it("should report insert operation with N lines added, 1 removed (g)", async () => {
+      // Replace single line with 3 lines (insertion effect)
+      const edit: EditOperation = {
+        startLine: 5,
+        endLine: 5,
+        content: "// inserted line 1\n// inserted line 2\n// inserted line 3"
+      };
+      const { diff, lineMap } = await editFile(testMatchesPath, [edit], true);
+      const formatted = formatEditOutput(diff, lineMap);
+      expect(formatted).toContain("Result: 3 lines added, 1 line removed");
+      expect(lineMap.added).toBe(3);
+      expect(lineMap.removed).toBe(1);
+    });
+
+    it("should report delete operation with 1 line added, N removed (h)", async () => {
+      // Replace 4 lines with empty string (becomes blank line)
+      const edit: EditOperation = {
+        startLine: 7,
+        endLine: 10,
+        content: ""
+      };
+      const { diff, lineMap } = await editFile(testMatchesPath, [edit], true);
+      const formatted = formatEditOutput(diff, lineMap);
+      expect(formatted).toContain("Result: 1 line added, 4 lines removed");
+      expect(lineMap.added).toBe(1);
+      expect(lineMap.removed).toBe(4);
+    });
+
+    it("should report no-op edit with 0 lines added, 0 removed (i)", async () => {
+      const edit: EditOperation = {
+        startLine: 2,
+        endLine: 2,
+        content: 'const Button = ({ color = "blue", size = "md" }) => {'
+      };
+      const { diff, lineMap } = await editFile(testMatchesPath, [edit], true);
+      const formatted = formatEditOutput(diff, lineMap);
+      expect(formatted).toContain(
+        "Result: 0 lines added, 0 lines removed"
+      );
+      expect(lineMap.lines).toEqual([]);
+      expect(lineMap.added).toBe(0);
+      expect(lineMap.removed).toBe(0);
+    });
+
+    it("should truncate line map when >100 lines (j)", async () => {
+      // Build a large edit: replace 10 lines with 120 lines
+      const originalLines = 10;
+      const edit: EditOperation = {
+        startLine: 7,
+        endLine: 10,
+        content: Array.from({ length: 120 }, (_, i) => `line ${i + 1}`).join("\n")
+      };
+      const { diff, lineMap } = await editFile(testMatchesPath, [edit], true);
+      const formatted = formatEditOutput(diff, lineMap);
+      expect(formatted).toMatch(/\.\.\. \(\d+ lines omitted\) \.\.\./);
+      // Verify truncation structure
+      expect(lineMap.lines.length).toBe(101); // 50 + 1 + 50
     });
   });
 });

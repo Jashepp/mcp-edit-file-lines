@@ -1,9 +1,22 @@
 # Edit File Lines MCP Server
 
-A TypeScript-based MCP server that provides tools for making precise line-based edits to text files within allowed directories.
+A TypeScript-based MCP server providing 6 tools for precise file editing: line-based edits with dry-run preview, dedicated insert/delete tools, exact whitespace rendering, and structural line-map output. All operations restricted to allowed directories.
 
 ## Features
 
+| Tool | Purpose |
+|------|---------|
+| `edit_file_lines` | Replace text/lines with pattern matching, dry-run preview, line-map output |
+| `add_file_lines` | Insert new line(s) after a given line (pure insert, never deletes) |
+| `remove_file_lines` | Delete a range of lines (pure remove, never adds) |
+| `get_file_lines` | View specific lines with context, optional exact-whitespace rendering |
+| `search_file` | Find text/regex across a file, optional exact-whitespace rendering |
+| `approve_edit` | Apply a previously dry-run edit / add / remove operation via its state ID |
+
+- **Dry-run workflow:** preview with `"dryRun": true` (returns state ID), inspect the diff/line map, then call `approve_edit` to apply.
+- **Line map output:** every edit/add/remove operation outputs `Result:` (add/remove counts) and a `Line map:` showing each changed line as `KEEP` / `REMOVE` / `ADD` with line numbers, making deletions and additions instantly visible.
+- **Exact whitespace:** `verboseWhitespace: true` on `get_file_lines` and `search_file` renders TAB as `\t` and SPACE as `\s`, so indentation can be reproduced verbatim (use `preserveIndentation: false` in edits for byte-exact results).
+- **Indentation control:** per-edit `preserveIndentation` flag (default `true`) to rebase content to the target line's indent, or `false` to apply content verbatim.
 ### Main Editing Tool
 
 #### `edit_file_lines`
@@ -231,10 +244,85 @@ Index: src/components/App.tsx
    const cardClass = `card-${theme} size-${size}`;
 ```
 
+### Insert New Lines
+
+#### `add_file_lines`
+Insert new line(s) after a given line number without removing anything. This is a pure insert operation - the preview will show only `ADD` and `KEEP` lines, never `REMOVE`.
+
+Arguments:
+```typescript
+{
+  p: string;         // Absolute file path
+  afterLine: number; // Line number to insert after (0 = start of file, before line 1)
+  content: string;   // New line(s) to insert, multi-line allowed
+  dryRun?: boolean;  // Preview without writing (default false)
+}
+```
+
+Example - insert after line 2:
+```json
+{
+  "p": "src/components/App.tsx",
+  "afterLine": 2,
+  "content": "// Helper comment added below Button",
+  "dryRun": true
+}
+```
+
+Output:
+```
+Result: 1 line added, 0 lines removed
+Line map:
+KEEP 1: // Basic component with props
+KEEP 2: const Button = ({ color = "blue", size = "md" }) => {
+ADD 3: // Helper comment added below Button
+KEEP 3:   return <button className={`btn-${color} size-${size}`}>Click me</button>;
+...
+```
+
+### Delete Lines
+
+#### `remove_file_lines`
+Delete a range of lines (startLine through endLine, inclusive). This is a pure remove operation - the preview will show only `REMOVE` and `KEEP` lines, never `ADD`.
+
+Arguments:
+```typescript
+{
+  p: string;         // Absolute file path
+  startLine: number; // First line to delete (1-indexed)
+  endLine: number;   // Last line to delete (inclusive, 1-indexed)
+  dryRun?: boolean;  // Preview without writing (default false)
+}
+```
+
+Example - delete lines 5 through 7 of a 200-line file:
+```json
+{
+  "p": "src/components/App.tsx",
+  "startLine": 5,
+  "endLine": 7,
+  "dryRun": true
+}
+```
+
+Output (lines 5-7 removed; file shrinks to 197 lines):
+```
+Result: 0 lines added, 3 lines removed
+Line map:
+KEEP 1: // First line
+KEEP 2: // Second line
+KEEP 3: // Third line
+KEEP 4: // Fourth line
+REMOVE 5: // Fifth line removed
+REMOVE 6: // Sixth line removed
+REMOVE 7: // Seventh line removed
+KEEP 8: // Eighth line
+... (up to line 200; original lines 8-200 become lines 5-197)
+```
 ### Additional Tools
 
 #### `approve_edit`
-Apply changes from a previous dry run of `edit_file_lines`. This tool provides a two-step editing process for safety. Here is an example workflow:
+Apply changes from a previous dry run of `edit_file_lines`, `add_file_lines`, or `remove_file_lines`. This tool provides a two-step editing process for safety.
 
 1. First, make a dry run edit:
 ```json 
@@ -320,6 +408,26 @@ Error: Invalid or expired state ID
 
 #### `get_file_lines`
 Inspect specific lines in a file with optional context lines. This tool is useful for verifying line content before making edits.
+**`verboseWhitespace` option:** Set `"verboseWhitespace": true` to render TAB as `\t` and SPACE as `\s`, making exact whitespace visible so you can reproduce indentation verbatim:
+
+```json
+{
+  "path": "src/components/App.tsx",
+  "lineNumbers": [2],
+  "context": 1,
+  "verboseWhitespace": true
+}
+```
+
+Output:
+```
+Line 2:
+  1: // Basic component with props
+> 2:   return <button className={`btn-${color} size-${size}`}>Click me</button>;
+
+Whitespace rendering (TAB -> \t, SPACE -> \s; other chars -> U+XXXX):
+> 2: \s\sreturn <button className={`btn-${color} size-${size}`}>Click me</button>;
+```
 
 ```json
 {
@@ -348,6 +456,7 @@ Line 3:
 
 #### `search_file`
 Search a file for text patterns or regular expressions to find specific line numbers and their surrounding context. This tool is particularly useful for locating the exact lines you want to edit with `edit_file_lines`.
+**`verboseWhitespace` option:** Set `"verboseWhitespace": true` to render TAB as `\t` and SPACE as `\s` in the output, making exact whitespace visible. Useful for verifying indentation before reproducing it in edits.
 
 Features:
 - Simple text search with optional case sensitivity
@@ -551,6 +660,18 @@ Common workflows:
    - Review the diff output before approving changes
    - Keep edit operations focused and atomic
    - Use appropriate pattern matching for your use case
+4. Verbose Whitespace
+   - `get_file_lines` and `search_file` support `"verboseWhitespace": true` to render TAB as `\t` and SPACE as `\s`, making whitespace visible. Non-whitespace characters outside printable ASCII render as `U+XXXX`.
+   - Use `get_file_lines` with `verboseWhitespace: true` to see exact indentation, then `edit_file_lines` with `preserveIndentation: false` and matching indentation to edit without altering whitespace.
+
+5. Preserve Indentation
+   - `edit_file_lines` accepts `preserveIndentation` per edit operation (default: `true`). When true, the base indent of your content is detected and re-indented to match the target line. When false, your content is applied verbatim. Set false when the rebase is wrong (e.g. file uses tabs, your content uses spaces, or vice versa).
+
+6. Line Map Output
+   - Every edit/add/remove operation outputs `Result:` with line counts and a `Line map:` showing KEEP/REMOVE/ADD per line, so deletions are always visible and countable.
+
+7. Force Dry-Run
+   - Pass `--force-dry-run` to the server startup command to reject any operation that does not set `"dryRun": true`. Useful for ensuring preview workflow compliance.
 
 
 ## Development
@@ -610,11 +731,9 @@ Use this script to:
 ## Usage
 
 The server requires one or more allowed directories to be specified when starting:
-
 ```bash
-node build/index.js <allowed-directory> [additional-directories...]
+node build/index.js [--force-dry-run] <allowed-directory> [additional-directories...]
 ```
-
 All file operations will be restricted to these directories for security.
 
 ### Environment Variables
